@@ -36,3 +36,7 @@ function request()
    
    return wrk.format("GET", path)
 end
+
+-- function delay()
+--    return 1000
+-- end
