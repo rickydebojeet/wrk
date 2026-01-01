@@ -38,7 +38,7 @@ def run_ssh_command(cmd, background=False):
 
 def start_server(flags):
     """Starts the server on the remote machine."""
-    run_ssh_command("pkill -x server")
+    run_ssh_command("pkill -9 -x server")
     time.sleep(COOL_DOWN_TIME)
     
     # Start new server pinned to core 0 (for now)
@@ -101,21 +101,36 @@ def parse_wrk_output(output):
 
 def parse_server_metrics(prefix, duration):
     """Fetches and parses the generated metric files from the server."""
-    data = {}
+    data = {
+        'llc_misses': 0, 
+        'longest_lat_cache_miss': 0, 
+        'context_switches': 0, 
+        'softirqs': 0, 
+        'disk_read_mb_sec': 0.0, 
+        'disk_utilization_percent': 0.0,
+        'cpu0_user_percent': 0.0, 
+        'cpu0_system_percent': 0.0, 
+        'cpu0_softirq_percent': 0.0, 
+        'cpu0_iowait_percent': 0.0, 
+        'cpu0_idle_percent': 0.0,
+        'memory_read_mb_sec_pcm': 0.0, 
+        'memory_reads_perf': 0
+    }
     
     perf_out = run_ssh_command(f"cat {SERVER_DIR}/{prefix}_perf.txt").stdout
-    
-    # LLC-load-misses (Read LLC misses) or cache-misses (fallback)
-    # User expects LLC-load-misses on server.
+
+    # LLC-load-misses (Read LLC misses)
     if 'LLC-load-misses' in perf_out:
         match = re.search(r"(\d[\d,]*)\s+LLC-load-misses", perf_out)
         if match:
             data['llc_misses'] = int(match.group(1).replace(',', ''))
-    elif 'cache-misses' in perf_out:
-        match = re.search(r"(\d[\d,]*)\s+cache-misses", perf_out)
+
+    # Longest Latency Cache Misses
+    if 'longest_lat_cache.miss' in perf_out:
+        match = re.search(r"(\d[\d,]*)\s+longest_lat_cache.miss", perf_out)
         if match:
-            data['llc_misses'] = int(match.group(1).replace(',', ''))
-        
+            data['longest_lat_cache_miss'] = int(match.group(1).replace(',', ''))
+
     # Context Switches & CPU0 Line (from /proc/stat)
     def get_proc_stat(filename):
         out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
@@ -132,6 +147,21 @@ def parse_server_metrics(prefix, duration):
     ctxt_end, cpu0_end_line = get_proc_stat(f"{prefix}_stat_end.txt")
     data['context_switches'] = ctxt_end - ctxt_start
 
+    # SoftIRQs (diff)
+    def get_softirqs(filename):
+        out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
+        total = 0
+        for line in out.splitlines():
+             if ':' in line and "CPU0" not in line:
+                 parts = line.split()
+                 for p in parts[1:]:
+                     if p.isdigit(): total += int(p)
+        return total
+    
+    si_start = get_softirqs(f"{prefix}_softirqs_start.txt")
+    si_end = get_softirqs(f"{prefix}_softirqs_end.txt")
+    data['softirqs'] = si_end - si_start
+
     # Disk Stats (Robust Selection)
     def get_disk_stats(filename):
         out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
@@ -146,8 +176,8 @@ def parse_server_metrics(prefix, duration):
 
     disk_start = get_disk_stats(f"{prefix}_disk_start.txt")
     disk_end = get_disk_stats(f"{prefix}_disk_end.txt")
-    
-    # Disk Stats Logic:
+
+    # Disk Stats Logic // Needs re-looks
     # 1. Throughput (MB/s): SUM of all "Disk" devices (avoiding partitions to prevent double count).
     # 2. Utilization (%): MAX of any device (to find bottleneck).
     
@@ -166,11 +196,6 @@ def parse_server_metrics(prefix, duration):
             elif dev[-1].isdigit():
                 is_partition = True # sda1
             
-            # If unsure, maybe just sum everything? No, double counting is bad.
-            # Let's count ONLY if it looks like a physical disk or we can't tell.
-            # Actually, /proc/diskstats lists partitions too. 
-            # Safest for now: Sum everything that is NOT a determined partition.
-            
             if not is_partition:
                 s_diff = disk_end[dev]['sectors_read'] - disk_start[dev]['sectors_read']
                 t_diff = disk_end[dev]['io_time_ms'] - disk_start[dev]['io_time_ms']
@@ -182,20 +207,6 @@ def parse_server_metrics(prefix, duration):
     data['disk_read_mb_sec'] = (total_sectors_diff * 512) / duration / (1024 * 1024)
     data['disk_utilization_percent'] = (max_io_time_diff / (duration * 1000.0)) * 100.0
 
-    # SoftIRQs (diff)
-    def get_softirqs(filename):
-        out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
-        total = 0
-        for line in out.splitlines():
-             if ':' in line and "CPU0" not in line:
-                 parts = line.split()
-                 for p in parts[1:]:
-                     if p.isdigit(): total += int(p)
-        return total
-    
-    si_start = get_softirqs(f"{prefix}_softirqs_start.txt")
-    si_end = get_softirqs(f"{prefix}_softirqs_end.txt")
-    data['softirqs'] = si_end - si_start
     
     # CPU Utilization (Core 0 Specific Breakdown)
     # Re-using cpu0 line from Step 3
@@ -227,13 +238,63 @@ def parse_server_metrics(prefix, duration):
             data['cpu0_iowait_percent'] = (cpu_end['iowait'] - cpu_start['iowait']) / diff_total * 100
             data['cpu0_idle_percent'] = (cpu_end['idle'] - cpu_start['idle']) / diff_total * 100
     
-    # 5. Memory Reads (LLC-loads or node-loads) // Needs re-look
+    # Legacy perf memory reads // Needs re-looks
     if 'node-loads' in perf_out:
         match = re.search(r"(\d[\d,]*)\s+node-loads", perf_out)
-        if match: data['memory_reads'] = int(match.group(1).replace(',', ''))
+        if match: data['memory_reads_perf'] = int(match.group(1).replace(',', ''))
     elif 'LLC-loads' in perf_out:
         match = re.search(r"(\d[\d,]*)\s+LLC-loads", perf_out)
-        if match: data['memory_reads'] = int(match.group(1).replace(',', ''))
+        if match: data['memory_reads_perf'] = int(match.group(1).replace(',', ''))
+
+    # Rename keys to match fieldnames for writer
+    data['memory_read_mb_sec_pcm'] = data.pop('memory_read_mb_sec', 0)
+    
+    # Memory Bandwidth (PCM)
+    # Parse ${prefix}_pcm_memory.csv
+    # Format usually: Time, System Read Throughput(MB/s), System Write...
+    def get_pcm_memory_read(filename):
+        try:
+             # We can't guarantee existence if pcm failed
+             out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
+             if not out: return 0.0
+             
+             # The CSV might contain header lines. 
+             # We are looking for "System Read Throughput(MB/s)" or similar
+             # Then average the values.
+             # pcm-memory csv is complex:
+             # Time, Socket 0 Read, Socket 0 Write, Socket 1..., System Read, System Write
+             lines = out.splitlines()
+             if len(lines) < 2: return 0.0
+             
+             # Locate "System Read" index
+             header = lines[0].split(',')
+             sys_read_idx = -1
+             for i, col in enumerate(header):
+                 if "System Read" in col: # Loose match
+                     sys_read_idx = i
+                     break
+             
+             if sys_read_idx == -1: return 0.0
+             
+             total = 0.0
+             count = 0
+             for line in lines[1:]: # Skip header
+                 parts = line.split(',')
+                 if len(parts) > sys_read_idx:
+                     val = parts[sys_read_idx]
+                     try:
+                         total += float(val)
+                         count += 1
+                     except ValueError:
+                         pass
+             
+             if count > 0: return total / count
+             return 0.0
+        except:
+             return 0.0
+
+
+    data['memory_read_mb_sec_pcm'] = get_pcm_memory_read(f"{prefix}_pcm_memory.csv")
     
     return data
 
@@ -244,9 +305,9 @@ def main():
 
     with open(RESULTS_FILE, "w", newline='') as csvfile:
         fieldnames = ['config', 'connections', 'throughput_req_sec', 'throughput_bandwidth_mb_sec', 'latency_avg_ms', 'errors',
-                      'llc_misses', 'context_switches', 'softirqs', 'disk_read_mb_sec', 'disk_utilization_percent', 
+                      'llc_misses', 'longest_lat_cache_miss', 'context_switches', 'softirqs', 'disk_read_mb_sec', 'disk_utilization_percent', 
                       'cpu0_user_percent', 'cpu0_system_percent', 'cpu0_softirq_percent', 'cpu0_iowait_percent', 'cpu0_idle_percent',
-                      'memory_reads']
+                      'memory_read_mb_sec_pcm', 'memory_reads_perf']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
