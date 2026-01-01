@@ -17,7 +17,7 @@ WRK_CPU_CORES = 4 # Number of cores to use for wrk
 COOL_DOWN_TIME = 5 # Sleep duration between diferent setups in seconds
 
 # Connection counts to test
-CONNECTIONS_LIST = [10, 50, 100, 200, 500, 1000]
+CONNECTIONS_LIST = [1, 5, 10]
 
 # Server configurations (name, flags)
 CONFIGURATIONS = [
@@ -42,12 +42,20 @@ def start_server(flags):
     time.sleep(COOL_DOWN_TIME)
     
     # Start new server pinned to core 0 (for now)
-    cmd = f"cd {SERVER_DIR} && taskset -c 0 ./server {SERVER_PORT} {flags}"
+    cmd = f"cd {SERVER_DIR} && taskset -c 0 ./server {SERVER_PORT} {flags} > server.log 2>&1"
     print(f"Starting server: {cmd}")
-    return run_ssh_command(cmd, background=True)
+    proc = run_ssh_command(cmd, background=True)
+    
+    # Check if it stayed alive
+    time.sleep(1)
+    check = run_ssh_command("pgrep -x server")
+    if not check.stdout.strip():
+        print("WARNING: Server process not found immediately after start!")
+    
+    return proc
 
 def stop_server():
-    run_ssh_command("pkill -x server")
+    run_ssh_command("pkill -9 -x server")
 
 def start_metrics(prefix, duration):
     """Starts metrics collection on server."""
@@ -78,6 +86,16 @@ def parse_wrk_output(output):
         if unit == "us": val /= 1000.0
         elif unit == "s": val *= 1000.0
         data['latency_avg_ms'] = val
+        
+    # Socket errors: connect 0, read 0, write 0, timeout 0
+    # Output format: "Socket errors: connect 15, read 42, write 0, timeout 0"
+    errors_match = re.search(r"Socket errors:\s+(.+)", output)
+    if errors_match:
+        # Parse the details, e.g. "connect 15, read 42..."
+        err_str = errors_match.group(1)
+        data['errors'] = err_str.strip()
+    else:
+        data['errors'] = "None"
         
     return data
 
@@ -225,7 +243,7 @@ def main():
     args = parser.parse_args()
 
     with open(RESULTS_FILE, "w", newline='') as csvfile:
-        fieldnames = ['config', 'connections', 'throughput_req_sec', 'throughput_bandwidth_mb_sec', 'latency_avg_ms', 
+        fieldnames = ['config', 'connections', 'throughput_req_sec', 'throughput_bandwidth_mb_sec', 'latency_avg_ms', 'errors',
                       'llc_misses', 'context_switches', 'softirqs', 'disk_read_mb_sec', 'disk_utilization_percent', 
                       'cpu0_user_percent', 'cpu0_system_percent', 'cpu0_softirq_percent', 'cpu0_iowait_percent', 'cpu0_idle_percent',
                       'memory_reads']
