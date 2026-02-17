@@ -18,21 +18,19 @@ export PCM_NO_MSR=1
 
 echo "Starting metrics collection for ${DURATION}s..."
 
-perf stat -e instructions, LLC-loads, LLC-load-misses, longest_lat_cache.miss, longest_lat_cache.reference, llc_misses.mem_read, llc_misses.mem_write \
+perf stat -e instructions,LLC-loads,LLC-load-misses,longest_lat_cache.miss,longest_lat_cache.reference,llc_misses.mem_read,llc_misses.mem_write \
     -o "${PREFIX}_perf.txt" \
-    --append 2>&1 \
     -- sleep "$DURATION" &
 PERF_PID=$!
 
-# Use pcm only if it is available
 if command -v pcm-memory &> /dev/null; then
-    pcm-memory /csv 1 -i=180 2>/dev/null 1>>"${PREFIX}_pcm_memory.csv"
+    pcm-memory /csv 1 -i=180 2>/dev/null 1>>"${PREFIX}_pcm_memory.csv" &
     PCM_PID=$!
 fi
 
 iostat -xd 1 ${DURATION} >> "${PREFIX}_iostat.txt" &
 DISK_PID=$!
-echo "iostat pid: ${disk_pid}"
+echo "iostat pid: ${DISK_PID}"
 
 cat /proc/softirqs > "${PREFIX}_softirqs_start.txt"
 cat /proc/stat > "${PREFIX}_stat_start.txt"

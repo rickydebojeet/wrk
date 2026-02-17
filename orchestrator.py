@@ -226,7 +226,7 @@ def parse_server_metrics(prefix, duration):
         for line in lines:
             line = line.strip()
             if not line:
-                continues
+                continue
 
             parts = line.split()
 
