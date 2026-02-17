@@ -18,7 +18,7 @@ export PCM_NO_MSR=1
 
 echo "Starting metrics collection for ${DURATION}s..."
 
-perf stat -e instructions,LLC-loads,LLC-load-misses,longest_lat_cache.miss,longest_lat_cache.reference,llc_misses.mem_read,llc_misses.mem_write \
+perf stat -e instructions,LLC-loads,LLC-load-misses,longest_lat_cache.miss,longest_lat_cache.reference \
     -o "${PREFIX}_perf.txt" \
     -- sleep "$DURATION" &
 PERF_PID=$!

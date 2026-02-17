@@ -121,8 +121,6 @@ def parse_server_metrics(prefix, duration):
         "LLC-load-misses": 0,
         "longest_lat_cache_miss": 0,
         "longest_lat_cache_reference": 0,
-        "llc_misses_memory_reads": 0,
-        "llc_misses_memory_writes": 0,
         "context_switches": 0,
         "softirqs": 0,
         "disk_read_per_s": 0.0,
@@ -168,18 +166,6 @@ def parse_server_metrics(prefix, duration):
         match = re.search(r"(\d[\d,]*)\s+longest_lat_cache.reference", perf_out)
         if match:
             data["longest_lat_cache_reference"] = int(match.group(1).replace(",", ""))
-
-    # LLC Misses that hit Memory Reads
-    if "llc_misses_memory_reads" in perf_out:
-        match = re.search(r"(\d[\d,]*)\s+llc_misses_memory_reads", perf_out)
-        if match:
-            data["llc_misses_memory_reads"] = int(match.group(1).replace(",", ""))
-
-    # LLC Misses that hit Memory Writes
-    if "llc_misses_memory_writes" in perf_out:
-        match = re.search(r"(\d[\d,]*)\s+llc_misses_memory_writes", perf_out)
-        if match:
-            data["llc_misses_memory_writes"] = int(match.group(1).replace(",", ""))
 
     # Context Switches & CPU0 Line (from /proc/stat)
     def get_proc_stat(filename):
@@ -380,8 +366,6 @@ def main():
             "LLC-load-misses",
             "longest_lat_cache_miss",
             "longest_lat_cache_reference",
-            "llc_misses_memory_reads",
-            "llc_misses_memory_writes",
             "context_switches",
             "softirqs",
             "disk_read_per_s",
