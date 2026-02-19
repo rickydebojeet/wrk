@@ -46,8 +46,8 @@ def start_server(flags):
     run_ssh_command("pkill -9 -x server")
     time.sleep(COOL_DOWN_TIME)
 
-    # Start new server pinned to core 0 (for now)
-    cmd = f"cd {SERVER_DIR} && taskset -c 0 ./server {EXPT_PORT} {flags} > server.log 2>&1"
+    # Start new server without CPU pinning
+    cmd = f"cd {SERVER_DIR} && ./server {EXPT_PORT} {flags} > server.log 2>&1"
     print(f"Starting server: {cmd}")
     proc = run_ssh_command(cmd, background=True)
 
@@ -126,11 +126,11 @@ def parse_server_metrics(prefix, duration):
         "disk_read_per_s": 0.0,
         "disk_read_kB_per_s": 0.0,
         "disk_utilization": 0.0,
-        "cpu0_user_percent": 0.0,
-        "cpu0_system_percent": 0.0,
-        "cpu0_softirq_percent": 0.0,
-        "cpu0_iowait_percent": 0.0,
-        "cpu0_idle_percent": 0.0,
+        "cpu_user_percent": 0.0,
+        "cpu_system_percent": 0.0,
+        "cpu_softirq_percent": 0.0,
+        "cpu_iowait_percent": 0.0,
+        "cpu_idle_percent": 0.0,
         "memory_read_mb_sec_pcm": 0.0,
         "memory_write_mb_sec_pcm": 0.0,
     }
@@ -167,20 +167,20 @@ def parse_server_metrics(prefix, duration):
         if match:
             data["longest_lat_cache_reference"] = int(match.group(1).replace(",", ""))
 
-    # Context Switches & CPU0 Line (from /proc/stat)
+    # Context Switches & Aggregate CPU Line (from /proc/stat)
     def get_proc_stat(filename):
         out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
         ctxt = 0
-        cpu0_line = ""
+        cpu_line = ""
         for line in out.splitlines():
             if line.startswith("ctxt "):
                 ctxt = int(line.split()[1])
-            if line.startswith("cpu0 "):
-                cpu0_line = line
-        return ctxt, cpu0_line
+            if line.startswith("cpu "):  # Aggregate CPU stats (not cpu0, cpu1, etc.)
+                cpu_line = line
+        return ctxt, cpu_line
 
-    ctxt_start, cpu0_start_line = get_proc_stat(f"{prefix}_stat_start.txt")
-    ctxt_end, cpu0_end_line = get_proc_stat(f"{prefix}_stat_end.txt")
+    ctxt_start, cpu_start_line = get_proc_stat(f"{prefix}_stat_start.txt")
+    ctxt_end, cpu_end_line = get_proc_stat(f"{prefix}_stat_end.txt")
     data["context_switches"] = ctxt_end - ctxt_start
 
     # SoftIRQs (diff)
@@ -267,9 +267,9 @@ def parse_server_metrics(prefix, duration):
         data["disk_read_kB_per_s"] = total_rkb
         data["disk_utilization"] = total_util
 
-    # CPU Utilization (Core 0 Specific Breakdown)
-    # Re-using cpu0 line from Step 3
-    def parse_cpu0_line(line):
+    # CPU Utilization (Aggregate across all CPUs)
+    # Using aggregate 'cpu' line from /proc/stat
+    def parse_cpu_line(line):
         if not line:
             return None
         parts = line.split()
@@ -286,25 +286,25 @@ def parse_server_metrics(prefix, duration):
             "total": sum(parsed),
         }
 
-    cpu_start = parse_cpu0_line(cpu0_start_line)
-    cpu_end = parse_cpu0_line(cpu0_end_line)
+    cpu_start = parse_cpu_line(cpu_start_line)
+    cpu_end = parse_cpu_line(cpu_end_line)
 
     if cpu_start and cpu_end:
         diff_total = cpu_end["total"] - cpu_start["total"]
         if diff_total > 0:
-            data["cpu0_user_percent"] = (
+            data["cpu_user_percent"] = (
                 (cpu_end["user"] - cpu_start["user"]) / diff_total * 100
             )
-            data["cpu0_system_percent"] = (
+            data["cpu_system_percent"] = (
                 (cpu_end["system"] - cpu_start["system"]) / diff_total * 100
             )
-            data["cpu0_softirq_percent"] = (
+            data["cpu_softirq_percent"] = (
                 (cpu_end["softirq"] - cpu_start["softirq"]) / diff_total * 100
             )
-            data["cpu0_iowait_percent"] = (
+            data["cpu_iowait_percent"] = (
                 (cpu_end["iowait"] - cpu_start["iowait"]) / diff_total * 100
             )
-            data["cpu0_idle_percent"] = (
+            data["cpu_idle_percent"] = (
                 (cpu_end["idle"] - cpu_start["idle"]) / diff_total * 100
             )
 
@@ -371,11 +371,11 @@ def main():
             "disk_read_per_s",
             "disk_read_kB_per_s",
             "disk_utilization",
-            "cpu0_user_percent",
-            "cpu0_system_percent",
-            "cpu0_softirq_percent",
-            "cpu0_iowait_percent",
-            "cpu0_idle_percent",
+            "cpu_user_percent",
+            "cpu_system_percent",
+            "cpu_softirq_percent",
+            "cpu_iowait_percent",
+            "cpu_idle_percent",
             "memory_read_mb_sec_pcm",
             "memory_write_mb_sec_pcm",
         ]
