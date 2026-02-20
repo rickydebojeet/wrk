@@ -4,6 +4,7 @@ import os
 import csv
 import re
 import argparse
+import socket
 
 # --- CONFIGURATION (User to update these) ---
 SERVER_IP = "127.0.0.1"  # REPLACE WITH ACTUAL SERVER IP
@@ -14,7 +15,11 @@ EXPT_PORT = 8080
 DURATION = 120  # Duration of each test in seconds
 RESULTS_FILE = "results.csv"
 WRK_CPU_CORES = 14  # Number of cores to use for wrk
-COOL_DOWN_TIME = 5  # Sleep duration between diferent setups in seconds
+COOL_DOWN_TIME = 10  # Sleep duration between diferent setups in seconds
+SERVER_READY_TIMEOUT = 30  # Seconds to wait for server to accept connections
+SERVER_READY_INTERVAL = 0.5  # Seconds between readiness checks
+WRK_RETRIES = 2  # Number of extra wrk attempts if it cannot connect
+WRK_RETRY_BACKOFF = 2  # Seconds to sleep between wrk attempts
 
 # List of disks to monitor in iostat (e.g. ['nvme0n1', 'sda'])
 DISKS = ["nvme0n1", "nvme1n1", "nvme2n1", "nvme3n1"]
@@ -58,6 +63,24 @@ def start_server(flags):
         print("WARNING: Server process not found immediately after start!")
 
     return proc
+
+
+def wait_for_server_ready(host, port, timeout_s, interval_s):
+    """Waits until the server accepts TCP connections and responds to HTTP."""
+    deadline = time.time() + timeout_s
+    last_err = None
+
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2) as sock:
+                sock.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                _ = sock.recv(64)
+            return True, None
+        except OSError as exc:
+            last_err = exc
+            time.sleep(interval_s)
+
+    return False, last_err
 
 
 def stop_server():
@@ -111,6 +134,15 @@ def parse_wrk_output(output):
         data["errors"] = "None"
 
     return data
+
+
+def has_socket_errors(err_str):
+    if not err_str or err_str == "None":
+        return False
+    for num in re.findall(r"\b\d+\b", err_str):
+        if int(num) > 0:
+            return True
+    return False
 
 
 def parse_server_metrics(prefix, duration):
@@ -408,6 +440,15 @@ def main():
                 # Start Server Metrics with buffer to ensure coverage
                 metrics_proc = start_metrics(prefix, duration + 5)
 
+                # Ensure server is ready before wrk
+                ready, err = wait_for_server_ready(
+                    SERVER_IP, EXPT_PORT, SERVER_READY_TIMEOUT, SERVER_READY_INTERVAL
+                )
+                if not ready:
+                    print(
+                        f"WARNING: Server not ready after {SERVER_READY_TIMEOUT}s: {err}"
+                    )
+
                 # Run WRK
                 # Usage: wrk -t <threads> -c <conns> -d <duration> -s load_urls.lua <base_url>
                 base_url = f"http://{SERVER_IP}:{EXPT_PORT}/"
@@ -430,6 +471,22 @@ def main():
 
                 print(f"Running wrk: {' '.join(wrk_cmd)}")
                 wrk_res = subprocess.run(wrk_cmd, capture_output=True, text=True)
+
+                # Retry wrk on connection issues
+                attempt = 0
+                while attempt < WRK_RETRIES:
+                    wrk_data = parse_wrk_output(wrk_res.stdout)
+                    if has_socket_errors(wrk_data.get("errors")):
+                        attempt += 1
+                        print(
+                            f"WRK socket errors detected, retry {attempt}/{WRK_RETRIES}..."
+                        )
+                        time.sleep(WRK_RETRY_BACKOFF)
+                        wrk_res = subprocess.run(
+                            wrk_cmd, capture_output=True, text=True
+                        )
+                        continue
+                    break
 
                 # Wait for metrics to finish (they sleep for duration)
                 metrics_proc.wait()
