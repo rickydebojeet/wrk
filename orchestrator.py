@@ -1,10 +1,10 @@
+import argparse
+import csv
+import os
+import re
+import socket
 import subprocess
 import time
-import os
-import csv
-import re
-import argparse
-import socket
 
 # --- CONFIGURATION (User to update these) ---
 SERVER_IP = "127.0.0.1"  # REPLACE WITH ACTUAL SERVER IP
@@ -18,8 +18,10 @@ WRK_CPU_CORES = 14  # Number of cores to use for wrk
 COOL_DOWN_TIME = 10  # Sleep duration between diferent setups in seconds
 SERVER_READY_TIMEOUT = 30  # Seconds to wait for server to accept connections
 SERVER_READY_INTERVAL = 0.5  # Seconds between readiness checks
-WRK_RETRIES = 2  # Number of extra wrk attempts if it cannot connect
-WRK_RETRY_BACKOFF = 2  # Seconds to sleep between wrk attempts
+MAX_TEST_RETRIES = (
+    3  # Number of times to restart the server and retry a failed data point
+)
+RETRY_BACKOFF = 5  # Seconds to sleep before retrying a failed test
 
 # List of disks to monitor in iostat (e.g. ['nvme0n1', 'sda'])
 DISKS = ["nvme0n1", "nvme1n1", "nvme2n1", "nvme3n1"]
@@ -46,21 +48,27 @@ def run_ssh_command(cmd, background=False):
         return result
 
 
+def stop_server():
+    """Gracefully stops the server using SIGINT, with a SIGKILL fallback."""
+    print("  Stopping server gracefully...")
+    run_ssh_command("pkill -2 -x server")
+    time.sleep(3)
+    run_ssh_command("pkill -9 -x server")
+
+
 def start_server(flags):
     """Starts the server on the remote machine."""
-    run_ssh_command("pkill -9 -x server")
+    stop_server()
     time.sleep(COOL_DOWN_TIME)
 
-    # Start new server without CPU pinning
     cmd = f"cd {SERVER_DIR} && ./server {EXPT_PORT} {flags} > server.log 2>&1"
-    print(f"Starting server: {cmd}")
+    print(f"  Starting server: {cmd}")
     proc = run_ssh_command(cmd, background=True)
 
-    # Check if it stayed alive
     time.sleep(1)
     check = run_ssh_command("pgrep -x server")
     if not check.stdout.strip():
-        print("WARNING: Server process not found immediately after start!")
+        print("  WARNING: Server process not found immediately after start!")
 
     return proc
 
@@ -83,14 +91,10 @@ def wait_for_server_ready(host, port, timeout_s, interval_s):
     return False, last_err
 
 
-def stop_server():
-    run_ssh_command("pkill -9 -x server")
-
-
 def start_metrics(prefix, duration):
     """Starts metrics collection on server."""
     cmd = f"cd {SERVER_DIR} && ./metrics_collector.sh {duration} {prefix}"
-    print(f"Starting metrics: {cmd}")
+    print(f"  Starting metrics: {cmd}")
     return run_ssh_command(cmd, background=True)
 
 
@@ -123,13 +127,9 @@ def parse_wrk_output(output):
             val *= 1000.0
         data["latency_avg_ms"] = val
 
-    # Socket errors: connect 0, read 0, write 0, timeout 0
-    # Output format: "Socket errors: connect 15, read 42, write 0, timeout 0"
     errors_match = re.search(r"Socket errors:\s+(.+)", output)
     if errors_match:
-        # Parse the details, e.g. "connect 15, read 42..."
-        err_str = errors_match.group(1)
-        data["errors"] = err_str.strip()
+        data["errors"] = errors_match.group(1).strip()
     else:
         data["errors"] = "None"
 
@@ -168,38 +168,27 @@ def parse_server_metrics(prefix, duration):
     }
 
     perf_out = run_ssh_command(f"cat {SERVER_DIR}/{prefix}_perf.txt").stdout
-
-    # Instructions
     if "instructions" in perf_out:
         match = re.search(r"(\d[\d,]*)\s+instructions", perf_out)
         if match:
             data["instructions"] = int(match.group(1).replace(",", ""))
-
-    # LLC-loads (Read LLC accesses)
     if "LLC-loads" in perf_out:
         match = re.search(r"(\d[\d,]*)\s+LLC-loads", perf_out)
         if match:
             data["LLC-loads"] = int(match.group(1).replace(",", ""))
-
-    # LLC-load-misses (Read LLC misses)
     if "LLC-load-misses" in perf_out:
         match = re.search(r"(\d[\d,]*)\s+LLC-load-misses", perf_out)
         if match:
             data["LLC-load-misses"] = int(match.group(1).replace(",", ""))
-
-    # Longest Latency Cache Misses
     if "longest_lat_cache.miss" in perf_out:
         match = re.search(r"(\d[\d,]*)\s+longest_lat_cache.miss", perf_out)
         if match:
             data["longest_lat_cache_miss"] = int(match.group(1).replace(",", ""))
-
-    # Longest Latency Cache Reference
     if "longest_lat_cache.reference" in perf_out:
         match = re.search(r"(\d[\d,]*)\s+longest_lat_cache.reference", perf_out)
         if match:
             data["longest_lat_cache_reference"] = int(match.group(1).replace(",", ""))
 
-    # Context Switches & Aggregate CPU Line (from /proc/stat)
     def get_proc_stat(filename):
         out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
         ctxt = 0
@@ -207,7 +196,7 @@ def parse_server_metrics(prefix, duration):
         for line in out.splitlines():
             if line.startswith("ctxt "):
                 ctxt = int(line.split()[1])
-            if line.startswith("cpu "):  # Aggregate CPU stats (not cpu0, cpu1, etc.)
+            if line.startswith("cpu "):
                 cpu_line = line
         return ctxt, cpu_line
 
@@ -215,7 +204,6 @@ def parse_server_metrics(prefix, duration):
     ctxt_end, cpu_end_line = get_proc_stat(f"{prefix}_stat_end.txt")
     data["context_switches"] = ctxt_end - ctxt_start
 
-    # SoftIRQs (diff)
     def get_softirqs(filename):
         out = run_ssh_command(f"cat {SERVER_DIR}/{filename}").stdout
         total = 0
@@ -232,23 +220,17 @@ def parse_server_metrics(prefix, duration):
     data["softirqs"] = si_end - si_start
 
     def parse_iostat_output(output_text, selected_disks):
-        """Parses iostat output, skips the boot report, and aggregates metrics."""
         lines = output_text.strip().split("\n")
         disk_data = {
             disk: {"r/s": [], "rkB/s": [], "%util": []} for disk in selected_disks
         }
-
         rs_idx, rkb_idx, util_idx = -1, -1, -1
         report_count = 0
-
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-
             parts = line.split()
-
-            # Detect headers and update column indices dynamically
             if parts[0] in ["Device", "Device:"]:
                 report_count += 1
                 try:
@@ -258,13 +240,9 @@ def parse_server_metrics(prefix, duration):
                 except ValueError:
                     pass
                 continue
-
-            # Skip the first block of stats (historical data since boot)
             if report_count == 1:
                 continue
-
             disk_name = parts[0]
-
             if disk_name in selected_disks and rs_idx != -1:
                 try:
                     disk_data[disk_name]["r/s"].append(float(parts[rs_idx]))
@@ -273,34 +251,22 @@ def parse_server_metrics(prefix, duration):
                 except (IndexError, ValueError):
                     pass
 
-        # Aggregate the averages across all targeted disks
-        total_rs = 0.0
-        total_rkb = 0.0
-        total_util = 0.0
-
+        total_rs, total_rkb, total_util = 0.0, 0.0, 0.0
         for disk, metrics in disk_data.items():
             samples = len(metrics["r/s"])
             if samples > 0:
-                avg_rs = sum(metrics["r/s"]) / samples
-                avg_rkb = sum(metrics["rkB/s"]) / samples
-                avg_util = sum(metrics["%util"]) / samples
-
-                total_rs += avg_rs
-                total_rkb += avg_rkb
-                total_util += avg_util
-
+                total_rs += sum(metrics["r/s"]) / samples
+                total_rkb += sum(metrics["rkB/s"]) / samples
+                total_util += sum(metrics["%util"]) / samples
         return total_rs, total_rkb, total_util
 
     iostat_out = run_ssh_command(f"cat {SERVER_DIR}/{prefix}_iostat.txt").stdout
-
     if iostat_out.strip():
         total_rs, total_rkb, total_util = parse_iostat_output(iostat_out, DISKS)
         data["disk_read_per_s"] = total_rs
         data["disk_read_kB_per_s"] = total_rkb
         data["disk_utilization"] = total_util
 
-    # CPU Utilization (Aggregate across all CPUs)
-    # Using aggregate 'cpu' line from /proc/stat
     def parse_cpu_line(line):
         if not line:
             return None
@@ -314,7 +280,6 @@ def parse_server_metrics(prefix, duration):
             "iowait": parsed[4],
             "irq": parsed[5],
             "softirq": parsed[6],
-            "steal": parsed[7] if len(parsed) > 7 else 0,
             "total": sum(parsed),
         }
 
@@ -341,35 +306,24 @@ def parse_server_metrics(prefix, duration):
             )
 
     def parse_pcm_memory_output(output_text):
-        """Parses PCM memory output to extract read and write bandwidth."""
-        mem_read_bw = 0.0
-        mem_write_bw = 0.0
+        mem_read_bw, mem_write_bw = 0.0, 0.0
         line_count = 0
-
         for line in output_text.splitlines():
             line = line.strip()
-
             if "2026-" in line and "Time" not in line:
                 parts = line.split(",")
-
-                # Ensure the line has enough columns to avoid index errors
                 if len(parts) >= 3:
                     try:
-                        # Your indices: Read is 3rd from the end, Write is 2nd from the end
                         mem_read_bw += float(parts[-3])
                         mem_write_bw += float(parts[-2])
                         line_count += 1
                     except ValueError:
-                        pass  # Skip lines where conversion to float fails
-
-        # Calculate the average dynamically based on actual lines captured
+                        pass
         if line_count > 0:
             return mem_read_bw / line_count, mem_write_bw / line_count
-
         return 0.0, 0.0
 
     pcm_out_raw = run_ssh_command(f"cat {SERVER_DIR}/{prefix}_pcm_memory.csv").stdout
-
     if pcm_out_raw.strip():
         read_bw, write_bw = parse_pcm_memory_output(pcm_out_raw)
         data["memory_read_mb_sec_pcm"] = read_bw
@@ -429,82 +383,91 @@ def main():
         run_ssh_command(f"chmod +x {SERVER_DIR}/metrics_collector.sh")
 
         for conf_name, conf_flags in CONFIGURATIONS:
-            # Start Server
-            server_proc = start_server(conf_flags)
-            time.sleep(COOL_DOWN_TIME)
-
             for c in conns:
-                print(f"--- Running: {conf_name} | Conns: {c} ---")
-                prefix = f"metrics_{conf_name}_{c}"
+                print(f"\n--- Running: {conf_name} | Conns: {c} ---")
 
-                # Start Server Metrics with buffer to ensure coverage
-                metrics_proc = start_metrics(prefix, duration + 5)
+                success = False
 
-                # Ensure server is ready before wrk
-                ready, err = wait_for_server_ready(
-                    SERVER_IP, EXPT_PORT, SERVER_READY_TIMEOUT, SERVER_READY_INTERVAL
-                )
-                if not ready:
-                    print(
-                        f"WARNING: Server not ready after {SERVER_READY_TIMEOUT}s: {err}"
+                # --- NEW RETRY LOOP ---
+                for attempt in range(1, MAX_TEST_RETRIES + 1):
+                    if attempt > 1:
+                        print(
+                            f"  --> Retrying entire data point (Attempt {attempt}/{MAX_TEST_RETRIES})..."
+                        )
+                        time.sleep(RETRY_BACKOFF)
+
+                    server_proc = start_server(conf_flags)
+                    prefix = f"metrics_{conf_name}_{c}"
+
+                    # Ensure server is ready before starting metrics and wrk
+                    ready, err = wait_for_server_ready(
+                        SERVER_IP,
+                        EXPT_PORT,
+                        SERVER_READY_TIMEOUT,
+                        SERVER_READY_INTERVAL,
                     )
+                    if not ready:
+                        print(f"  WARNING: Server not ready: {err}")
+                        stop_server()
+                        continue  # Start the outer retry loop over again
 
-                # Run WRK
-                # Usage: wrk -t <threads> -c <conns> -d <duration> -s load_urls.lua <base_url>
-                base_url = f"http://{SERVER_IP}:{EXPT_PORT}/"
+                    # Start Server Metrics
+                    metrics_proc = start_metrics(prefix, duration + 5)
 
-                threads = min(c, WRK_CPU_CORES) if c > 1 else 1
+                    # Run WRK
+                    base_url = f"http://{SERVER_IP}:{EXPT_PORT}/"
+                    threads = min(c, WRK_CPU_CORES) if c > 1 else 1
+                    wrk_cmd = [
+                        "./wrk",
+                        "-t",
+                        str(threads),
+                        "-c",
+                        str(c),
+                        "-d",
+                        str(duration) + "s",
+                        "-s",
+                        "load_urls.lua",
+                        "--latency",
+                        base_url,
+                    ]
 
-                wrk_cmd = [
-                    "./wrk",
-                    "-t",
-                    str(threads),
-                    "-c",
-                    str(c),
-                    "-d",
-                    str(duration) + "s",
-                    "-s",
-                    "load_urls.lua",
-                    "--latency",
-                    base_url,
-                ]
+                    print(f"  Running wrk: {' '.join(wrk_cmd)}")
+                    wrk_res = subprocess.run(wrk_cmd, capture_output=True, text=True)
 
-                print(f"Running wrk: {' '.join(wrk_cmd)}")
-                wrk_res = subprocess.run(wrk_cmd, capture_output=True, text=True)
-
-                # Retry wrk on connection issues
-                attempt = 0
-                while attempt < WRK_RETRIES:
+                    # Check for errors. If wrk spits out socket errors, the server likely crashed.
                     wrk_data = parse_wrk_output(wrk_res.stdout)
                     if has_socket_errors(wrk_data.get("errors")):
-                        attempt += 1
                         print(
-                            f"WRK socket errors detected, retry {attempt}/{WRK_RETRIES}..."
+                            "  WARNING: WRK socket errors detected! Server likely crashed."
                         )
-                        time.sleep(WRK_RETRY_BACKOFF)
-                        wrk_res = subprocess.run(
-                            wrk_cmd, capture_output=True, text=True
-                        )
-                        continue
+                        # Force kill the metrics script since we are aborting this run
+                        run_ssh_command("pkill -9 -f metrics_collector.sh")
+                        stop_server()
+                        continue  # Start the outer retry loop over again
+
+                    # If we made it here, no socket errors occurred! Wait for metrics to finish.
+                    metrics_proc.wait()
+
+                    # Parse all data
+                    server_data = parse_server_metrics(prefix, duration)
+                    row = {"config": conf_name, "connections": c}
+                    row.update(wrk_data)
+                    row.update(server_data)
+
+                    print(f"Result: {row}")
+                    writer.writerow(row)
+                    csvfile.flush()
+
+                    # Test passed, stop the server cleanly and exit the retry loop
+                    stop_server()
+                    success = True
                     break
 
-                # Wait for metrics to finish (they sleep for duration)
-                metrics_proc.wait()
-
-                # Parse
-                wrk_data = parse_wrk_output(wrk_res.stdout)
-                server_data = parse_server_metrics(prefix, duration)
-
-                row = {"config": conf_name, "connections": c}
-                row.update(wrk_data)
-                row.update(server_data)
-
-                print(f"Result: {row}")
-                writer.writerow(row)
-                csvfile.flush()
-
-            stop_server()
-            time.sleep(COOL_DOWN_TIME)
+                # If we exhausted all retries without a success
+                if not success:
+                    print(
+                        f"  ERROR: Failed to complete data point {conf_name} @ {c} conns after {MAX_TEST_RETRIES} attempts. Skipping."
+                    )
 
 
 if __name__ == "__main__":
